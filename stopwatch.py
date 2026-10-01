@@ -21,6 +21,7 @@ LOGO_FILENAME = "logo.png"
 DEFAULT_WIDTH = 624
 DEFAULT_HEIGHT = 262
 MARGIN = 12            # uniform margin between content and the window edges
+ICON_SIZE = 64         # downsampled size used for the window/taskbar icon
 MIN_FONT_SIZE = 8
 MAX_FONT_SIZE = 1000
 FPS = 60
@@ -133,6 +134,8 @@ class Stopwatch:
         self._font_name = self._find_monospace_font()
         self._font_cache: dict[int, pygame.font.Font] = {}
         self._logo_source = self._load_logo()
+        if self._logo_source is not None:
+            pygame.display.set_icon(self._window_icon())
         self._text_cache: tuple[str, pygame.Surface] | None = None
         self._window_size = pygame.display.get_window_size()
         self._layout: _Layout | None = self._build_layout(self._window_size)
@@ -297,6 +300,13 @@ class Stopwatch:
         # Always rescale from the pristine source: scaling an already-scaled
         # surface compounds resampling loss on every resize.
         return pygame.transform.smoothscale(self._logo_source, (size, size))
+
+    def _window_icon(self) -> pygame.Surface:
+        # The 400px source is fine for set_icon(), but letting the OS scale
+        # it all the way down to a 16px taskbar icon leaves a rough
+        # nearest-neighbour mess; 64px downsamples cleanly at every size.
+        return pygame.transform.smoothscale(
+            self._logo_source, (ICON_SIZE, ICON_SIZE))
 
 
 def main() -> None:
