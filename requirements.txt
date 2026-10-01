@@ -1,0 +1,2 @@
+# 2.1+ required: pygame.display.get_window_size() (used for resize handling)
+pygame-ce>=2.1
