@@ -8,8 +8,18 @@ big green `HH:MM:SS` readout. No buttons, no mouse — keyboard only.
 ## How to run
 
 ```
+# Set up a venv:
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install requirements into this venv:
 pip install -r requirements.txt
-python3 stopwatch.py
+
+# Now run it:
+python stopwatch.py
+
+# Deactivate the venv when finished:
+deactivate
 ```
 
 ## Controls
