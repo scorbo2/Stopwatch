@@ -1,0 +1,13 @@
+#!/bin/bash
+#
+# Wrapper: activates the project venv, runs the stopwatch, forwards all
+# command line arguments (e.g. --logo ~/pictures/sponsor_logo.png).
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$SCRIPT_DIR/.venv/bin/activate"
+python "$SCRIPT_DIR/stopwatch.py" "$@"
+status=$?
+deactivate
+
+exit "$status"

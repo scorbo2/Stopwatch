@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Stopwatch — a minimalist pygame-ce stopwatch.
 
+Usage:
+  stopwatch [--logo IMAGE]
+
+  --logo IMAGE   any readable image file (PNG, JPG, GIF, BMP, WEBP ...).
+                 Omit it to fall back to the bundled logo.png. The image's
+                 aspect ratio is always preserved.
+
 Keyboard-only controls:
   Space   start the timer; while running, pause; while paused, resume.
   Escape  reset to 00:00:00; if the timer was running, restart immediately.
@@ -10,7 +17,10 @@ are rescaled so the display always fits, keeping a uniform margin around
 all edges.
 """
 
+import argparse
+import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +28,20 @@ import pygame
 
 # ---------------------------------------------------------------- Tunables
 LOGO_FILENAME = "logo.png"
+
+# Resolution ceiling for the pristine logo. smoothscale() reads every source
+# pixel, and it does so on every single resize event — a 12-megapixel "logo"
+# handed to us via --logo would turn window-dragging into a slideshow. 2048px
+# is far beyond any size the window will ever ask for.
+MAX_LOGO_SOURCE_DIM = 2048
+
+# Share of the usable width the logo is allowed to claim. Without a ceiling, a
+# banner-shaped --logo (say 1600x300) would eat almost the whole window and
+# leave the readout at its 8px minimum — a very crisp, very useless stopwatch.
+# 0.75 is high enough that the bundled square logo is never affected at sane
+# window sizes; only extreme proportions get reined in.
+LOGO_MAX_WIDTH_FRACTION = 0.75
+
 DEFAULT_WIDTH = 624
 DEFAULT_HEIGHT = 262
 MARGIN = 12            # uniform margin between content and the window edges
@@ -53,6 +77,30 @@ MONO_FONT_CANDIDATES = (
 # app still works, it just can't clear a stuck "space held" flag after focus
 # loss (a very rare edge case).
 FOCUS_LOST_EVENT = getattr(pygame, "WINDOWFOCUSLOST", None)
+
+BUNDLED_LOGO_PATH = Path(__file__).resolve().with_name(LOGO_FILENAME)
+
+
+class LogoLoadError(Exception):
+    """The requested logo file could not be found or decoded."""
+
+
+def fit_within(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
+    """Largest aspect-preserving size for a src_w x src_h image in max_w x max_h.
+
+    Returns (0, 0) when the box is degenerate (negative or zero, or an empty
+    source), which callers read as "there is no room for the logo".
+    """
+    if src_w <= 0 or src_h <= 0 or max_w <= 0 or max_h <= 0:
+        return (0, 0)
+    scale = min(max_w / src_w, max_h / src_h)
+    # Floor rather than round: rounding up could push a pixel past the box and
+    # eat into the uniform margin.
+    width = min(max_w, int(src_w * scale))
+    height = min(max_h, int(src_h * scale))
+    # A logo one pixel wide is still a logo; nothing here may collapse to zero
+    # once the box itself has real size.
+    return (max(width, 1), max(height, 1))
 
 
 def format_time(elapsed_seconds: float) -> str:
@@ -114,7 +162,7 @@ class _Layout:
     """Everything that depends only on the current window size."""
 
     logo: pygame.Surface | None
-    logo_pos: tuple[int, int]
+    logo_rect: pygame.Rect | None
     font: pygame.font.Font
     text_area: pygame.Rect
 
@@ -122,7 +170,15 @@ class _Layout:
 class Stopwatch:
     """The single-window stopwatch application."""
 
-    def __init__(self) -> None:
+    def __init__(self, logo_path: Path | None = None) -> None:
+        """Build the app.
+
+        logo_path names the image to display; None means "use the bundled
+        logo.png". An explicitly requested logo that cannot be read is fatal
+        (LogoLoadError), because silently showing something else would just
+        be confusing. The bundled fallback stays cosmetic: a missing logo has
+        never been a reason to deny someone a stopwatch.
+        """
         pygame.init()
         pygame.display.set_mode((DEFAULT_WIDTH, DEFAULT_HEIGHT), pygame.RESIZABLE)
         pygame.display.set_caption("Stopwatch")
@@ -133,7 +189,7 @@ class Stopwatch:
         self._space_down = False
         self._font_name = self._find_monospace_font()
         self._font_cache: dict[int, pygame.font.Font] = {}
-        self._logo_source = self._load_logo()
+        self._logo_source = self._load_logo(logo_path)
         if self._logo_source is not None:
             pygame.display.set_icon(self._window_icon())
         self._text_cache: tuple[str, pygame.Surface] | None = None
@@ -200,19 +256,40 @@ class Stopwatch:
         if usable_w < MIN_FONT_SIZE or usable_h < MIN_FONT_SIZE:
             return None
 
-        # The logo is square and fills the usable height, capped so the
-        # text always keeps at least its minimum-size footprint.
+        # The logo may claim up to LOGO_MAX_WIDTH_FRACTION of the usable width,
+        # never so much that the readout can no longer render at MIN_FONT_SIZE,
+        # and it shrinks into that box without distorting its aspect ratio. At
+        # ordinary window sizes the bundled square logo is unconstrained by both
+        # caps, so it simply fills the usable height as it always has.
         min_text_width = self._get_font(MIN_FONT_SIZE).size(WORST_CASE_TEXT)[0]
-        logo_size = max(0, min(usable_h, usable_w - min_text_width))
-        text_area = pygame.Rect(
-            MARGIN + logo_size, MARGIN, usable_w - logo_size, usable_h
-        )
+        logo_budget = min(usable_w - min_text_width,
+                          int(usable_w * LOGO_MAX_WIDTH_FRACTION))
+        logo_rect = self._logo_box(logo_budget, usable_h)
+        logo_w = logo_rect.w if logo_rect is not None else 0
+
+        text_area = pygame.Rect(MARGIN + logo_w, MARGIN, usable_w - logo_w, usable_h)
 
         return _Layout(
-            logo=self._scaled_logo(logo_size),
-            logo_pos=(MARGIN, MARGIN),
+            logo=self._scaled_logo(logo_rect),
+            logo_rect=logo_rect,
             font=self._get_font(self._fit_font_size(text_area.w, usable_h)),
             text_area=text_area,
+        )
+
+    def _logo_box(self, max_width: int, max_height: int) -> pygame.Rect | None:
+        """Where the logo goes: left-aligned, vertically centred, undistorted."""
+        if self._logo_source is None:
+            return None
+        width, height = fit_within(
+            *self._logo_source.get_size(), max_width, max_height
+        )
+        if width == 0 or height == 0:
+            return None
+        return pygame.Rect(
+            MARGIN,
+            MARGIN + (max_height - height) // 2,
+            width,
+            height,
         )
 
     def _fit_font_size(self, max_width: int, max_height: int) -> int:
@@ -246,8 +323,8 @@ class Stopwatch:
         layout = self._layout
         if layout is None:
             return
-        if layout.logo is not None:
-            screen.blit(layout.logo, layout.logo_pos)
+        if layout.logo is not None and layout.logo_rect is not None:
+            screen.blit(layout.logo, layout.logo_rect)
         text_surface = self._rendered_text(layout.font)
         center_x, center_y = layout.text_area.center
         screen.blit(
@@ -279,39 +356,112 @@ class Stopwatch:
         for name in MONO_FONT_CANDIDATES:
             if pygame.font.match_font(name):
                 return name
-        print("Stopwatch: no monospace font found; using pygame's default font.")
+        print("Stopwatch: no monospace font found; using pygame's default font.",
+              file=sys.stderr)
         return None
 
     @staticmethod
-    def _load_logo() -> pygame.Surface | None:
-        logo_path = Path(__file__).resolve().with_name(LOGO_FILENAME)
+    def _load_logo(logo_path: Path | None) -> pygame.Surface | None:
+        path = logo_path or BUNDLED_LOGO_PATH
         try:
-            # convert_alpha() bakes in per-pixel alpha for cheap blits.
-            return pygame.image.load(str(logo_path)).convert_alpha()
-        except pygame.error as exc:
-            # A missing logo is cosmetic; the timer is the whole point.
-            print(f"Stopwatch: could not load {logo_path} ({exc}); "
-                  f"continuing without a logo.")
+            return load_image(path)
+        except LogoLoadError as exc:
+            if logo_path is not None:
+                raise
+            # A missing bundled logo is cosmetic; the timer is the whole point.
+            # stderr, because stdout is block-buffered when redirected and a
+            # killed process would otherwise take this warning down with it.
+            print(f"Stopwatch: {exc}; continuing without a logo.",
+                  file=sys.stderr)
             return None
 
-    def _scaled_logo(self, size: int) -> pygame.Surface | None:
-        if self._logo_source is None or size <= 0:
+    def _scaled_logo(self, logo_rect: pygame.Rect | None) -> pygame.Surface | None:
+        if self._logo_source is None or logo_rect is None:
             return None
         # Always rescale from the pristine source: scaling an already-scaled
         # surface compounds resampling loss on every resize.
-        return pygame.transform.smoothscale(self._logo_source, (size, size))
+        return pygame.transform.smoothscale(self._logo_source, logo_rect.size)
 
     def _window_icon(self) -> pygame.Surface:
-        # The 400px source is fine for set_icon(), but letting the OS scale
-        # it all the way down to a 16px taskbar icon leaves a rough
-        # nearest-neighbour mess; 64px downsamples cleanly at every size.
-        return pygame.transform.smoothscale(
-            self._logo_source, (ICON_SIZE, ICON_SIZE))
+        # Window managers rescale the icon to 16px themselves, and from a
+        # 400px+ source that leaves a rough nearest-neighbour mess; 64px
+        # downsamples cleanly at every size they might ask for. Taskbar icons
+        # are square, so an off-square logo is centred on a transparent
+        # square canvas rather than stretched into a funhouse mirror.
+        icon = pygame.Surface((ICON_SIZE, ICON_SIZE), pygame.SRCALPHA)
+        width, height = fit_within(
+            *self._logo_source.get_size(), ICON_SIZE, ICON_SIZE
+        )
+        icon.blit(
+            pygame.transform.smoothscale(self._logo_source, (width, height)),
+            ((ICON_SIZE - width) // 2, (ICON_SIZE - height) // 2),
+        )
+        return icon
 
 
-def main() -> None:
-    Stopwatch().run()
+def load_image(path: Path) -> pygame.Surface:
+    """Read an image file into a blit-ready surface, capped for resize speed.
+
+    Requires pygame.init() to have run, hence the module-level function
+    rather than anything importable before display initialisation.
+    """
+    if not path.exists():
+        raise LogoLoadError(f"could not load logo: no such file '{path}'")
+    if not path.is_file():
+        raise LogoLoadError(f"could not load logo: '{path}' is not a file")
+    try:
+        # convert_alpha() bakes in per-pixel alpha for cheap blits, and also
+        # promotes palette/8-bit files to a format smoothscale() will accept.
+        source = pygame.image.load(str(path)).convert_alpha()
+    except (pygame.error, OSError) as exc:
+        raise LogoLoadError(
+            f"could not load logo '{path}': {exc}. Supported formats include "
+            "PNG, JPG, GIF, BMP, WEBP and TIF."
+        ) from exc
+
+    width, height = source.get_size()
+    if max(width, height) > MAX_LOGO_SOURCE_DIM:
+        source = pygame.transform.smoothscale(
+            source,
+            fit_within(width, height, MAX_LOGO_SOURCE_DIM, MAX_LOGO_SOURCE_DIM),
+        )
+    return source
+
+
+def as_image_path(raw: str) -> Path:
+    """Turn a command line argument into a usable path.
+
+    expanduser() covers the quoted-tilde case ('--logo "~/emblem.png"'),
+    which the shell politely refuses to expand on our behalf.
+    """
+    return Path(raw).expanduser()
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="stopwatch",
+        description="A minimalist keyboard-only stopwatch.",
+    )
+    parser.add_argument(
+        "--logo",
+        metavar="IMAGE",
+        type=as_image_path,
+        help=f"image file to display beside the readout, aspect ratio "
+             f"preserved (PNG, JPG, GIF, BMP, WEBP). Default: "
+             f"{LOGO_FILENAME} next to stopwatch.py",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        Stopwatch(logo_path=args.logo).run()
+    except LogoLoadError as exc:
+        print(f"Stopwatch: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
